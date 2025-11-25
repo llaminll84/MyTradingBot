@@ -1,0 +1,384 @@
+#!/usr/bin/env python3
+# coding: utf-8
+"""
+Trader bot main script
+- اجرا به صورت سرویس: خواندن توکن از env, حلقه تکرار هر N ثانیه
+- لاگ در فایل و چاپ در کنسول
+- استفاده از ccxt برای fetch ticker/ohlcv و pandas/pandas_ta برای محاسبه اندیکاتورها
+"""
+
+import os
+import sys
+import time
+import signal
+import traceback
+from datetime import datetime
+import requests
+import ccxt
+import pandas as pd
+import pandas_ta as ta
+
+# ---------------------------
+# تنظیمات پایه (قابل تغییر از env)
+# ---------------------------
+BOT_TOKEN = os.getenv("BOT_TOKEN")               # توکن ربات تلگرام
+CHAT_ID = os.getenv("CHAT_ID")                   # chat id یا کانال
+SLEEP_INTERVAL = int(os.getenv("SLEEP_INTERVAL", "900"))  # ثانیه بین هر سیکل (پیش‌فرض 15 دقیقه)
+LOG_FILE = os.getenv("LOG_FILE", "trader_bot_log.txt")
+TIMEFRAMES = os.getenv("TIMEFRAMES", "45m,4h").split(",")
+RISK_REWARD = float(os.getenv("RISK_REWARD", "2"))
+FIBO_LOOKBACK = int(os.getenv("FIBO_LOOKBACK", "50"))
+VOLUME_LOOKBACK = int(os.getenv("VOLUME_LOOKBACK", "20"))
+MIN_24H_VOLUME_USDT = float(os.getenv("MIN_24H_VOLUME_USDT", "5000000"))
+MIN_24H_GROWTH_PERCENT = float(os.getenv("MIN_24H_GROWTH_PERCENT", "10"))
+MAX_SYMBOLS_TO_PROCESS = int(os.getenv("MAX_SYMBOLS_TO_PROCESS", "100"))
+EXCHANGE_ID = os.getenv("EXCHANGE_ID", "kucoin").lower()  # default kucoin
+FETCH_TICKERS_RETRIES = int(os.getenv("FETCH_TICKERS_RETRIES", "3"))
+
+# ---------------------------
+# امن خروج با سیگنال
+# ---------------------------
+SHUTDOWN = False
+
+
+def _signal_handler(sig, frame):
+    global SHUTDOWN
+    log_message(f"Received signal {sig}. Preparing to shutdown gracefully...", "INFO")
+    SHUTDOWN = True
+
+
+for s in (signal.SIGINT, signal.SIGTERM):
+    try:
+        signal.signal(s, _signal_handler)
+    except Exception:
+        pass
+
+# ---------------------------
+# مقداردهی اکسچنج ccxt
+# ---------------------------
+def make_exchange():
+    """اینجا اگر نیاز به API KEY/SECRET داری، از env بخون"""
+    api_key = os.getenv("EXCHANGE_API_KEY")
+    api_secret = os.getenv("EXCHANGE_API_SECRET")
+    opts = {"enableRateLimit": True}
+    try:
+        if EXCHANGE_ID == "kucoin":
+            ex = ccxt.kucoin(opts)
+        elif EXCHANGE_ID == "binance":
+            ex = ccxt.binance(opts)
+        elif EXCHANGE_ID == "gate":
+            ex = ccxt.gate(opts)
+        else:
+            # fallback به kucoin
+            ex = ccxt.kucoin(opts)
+    except Exception as e:
+        # fallback safe
+        ex = ccxt.kucoin(opts)
+    if api_key and api_secret:
+        try:
+            ex.apiKey = api_key
+            ex.secret = api_secret
+        except Exception:
+            pass
+    return ex
+
+
+exchange = make_exchange()
+
+# ---------------------------
+# Utility: logging + telegram
+# ---------------------------
+def log_message(message, level="INFO"):
+    """ثبت پیام در فایل لاگ و چاپ در کنسول"""
+    timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    entry = f"[{timestamp}] [{level}] {message}"
+    print(entry, flush=True)
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(entry + "\n")
+    except Exception as e:
+        # اگر لاگ فایل هم ایراد داشت، حداقل در کنسول چاپ شده
+        print(f"[{timestamp}] [ERROR] Cannot write log file: {e}", flush=True)
+
+
+def send_telegram_message(text):
+    """ارسال پیام به تلگرام — اگر توکن یا چت آیدی نباشد، ثبت ارور در لاگ"""
+    if not BOT_TOKEN or not CHAT_ID:
+        log_message("BOT_TOKEN or CHAT_ID not provided. Skipping Telegram send.", "WARNING")
+        return False
+    try:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+        payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"}
+        resp = requests.post(url, json=payload, timeout=20)
+        if resp.status_code != 200:
+            log_message(f"Telegram API returned {resp.status_code}: {resp.text}", "ERROR")
+            return False
+        return True
+    except Exception as e:
+        log_message(f"Exception sending telegram message: {e}", "ERROR")
+        return False
+
+# ---------------------------
+# Market scan: hot symbols
+# ---------------------------
+def get_hot_symbols():
+    """اسکن بازار بر اساس حجم و رشد ۲۴ ساعته"""
+    log_message("Starting market scan for hot assets...")
+    for attempt in range(FETCH_TICKERS_RETRIES):
+        try:
+            tickers = exchange.fetch_tickers()
+            hot_symbols = []
+            for symbol, ticker in tickers.items():
+                try:
+                    # فیلتر USDT
+                    if not symbol.endswith("/USDT"):
+                        continue
+                    # skip swap labels if present
+                    if "swap" in symbol.lower():
+                        continue
+
+                    volume_usdt = ticker.get("quoteVolume") or ticker.get("baseVolume") or ticker.get("quoteVolume")
+                    # بعضی اکسچنج‌ها ساختار متفاوت دارند؛ امن‌سازی:
+                    try:
+                        volume_usdt = float(volume_usdt) if volume_usdt is not None else 0.0
+                    except Exception:
+                        volume_usdt = 0.0
+
+                    percentage_change = ticker.get("percentage") or ticker.get("percentageChange") or ticker.get("change")
+                    try:
+                        percentage_change = float(percentage_change) if percentage_change is not None else 0.0
+                    except Exception:
+                        percentage_change = 0.0
+
+                    if volume_usdt and volume_usdt >= MIN_24H_VOLUME_USDT:
+                        if abs(percentage_change) >= MIN_24H_GROWTH_PERCENT:
+                            hot_symbols.append(symbol)
+                        elif volume_usdt >= MIN_24H_VOLUME_USDT * 5:
+                            hot_symbols.append(symbol)
+                except Exception:
+                    # محافظت در برابر ticker غیرمعمول
+                    continue
+
+            hot_symbols = list(dict.fromkeys(hot_symbols))  # remove duplicates, keep order
+            if len(hot_symbols) > MAX_SYMBOLS_TO_PROCESS:
+                hot_symbols = hot_symbols[:MAX_SYMBOLS_TO_PROCESS]
+
+            log_message(f"Found {len(hot_symbols)} hot symbols to analyze.")
+            return hot_symbols
+        except Exception as e:
+            log_message(f"Error fetching tickers (Attempt {attempt + 1}): {e}. Retrying...", "WARNING")
+            time.sleep(5)
+    log_message("Failed to fetch tickers after retries.", "ERROR")
+    return []
+
+# ---------------------------
+# Data fetching + indicators
+# ---------------------------
+def fetch_and_calculate_data(symbol, timeframe):
+    """دریافت OHLCV و محاسبه EMA200, RSI, ATR و حجم میانگین"""
+    try:
+        # limit حدود 300 کندل، کافی برای فیبو و EMA200
+        bars = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=300)
+        if not bars:
+            return None
+        df = pd.DataFrame(bars, columns=["time", "open", "high", "low", "close", "volume"])
+        df["time"] = pd.to_datetime(df["time"], unit="ms")
+        # اندیکاتورها
+        # استفاده از pandas_ta. در بعضی ورژن‌ها تابع بازگشتی دیتافریم/سریز متفاوت است؛ امن بنویسیم:
+        try:
+            ema200 = ta.ema(df["close"], length=200)
+            if isinstance(ema200, pd.Series):
+                df["ema200"] = ema200
+            else:
+                df["ema200"] = ema200.iloc[:, 0] if hasattr(ema200, "iloc") else ema200
+        except Exception:
+            # fallback ساده‌تر
+            df["ema200"] = df["close"].ewm(span=200, adjust=False).mean()
+
+        try:
+            df["rsi"] = ta.rsi(df["close"], length=14)
+        except Exception:
+            df["rsi"] = df["close"].diff().apply(lambda x: 0)  # placeholder if ta fails
+
+        try:
+            df["atr"] = ta.atr(df["high"], df["low"], df["close"], length=14)
+        except Exception:
+            df["atr"] = (df["high"] - df["low"]).rolling(14).mean()
+
+        df["avg_vol"] = df["volume"].rolling(window=VOLUME_LOOKBACK, min_periods=1).mean()
+        return df
+    except Exception as e:
+        log_message(f"fetch_and_calculate_data error for {symbol} {timeframe}: {e}", "ERROR")
+        return None
+
+# ---------------------------
+# Fibonacci confluence check
+# ---------------------------
+def check_fibo_confluence(df, is_long):
+    """چک کردن قرارگیری قیمت در محدوده 50% - 61.8% فیبوناچی"""
+    if df is None or len(df) < FIBO_LOOKBACK + 1:
+        return False
+    recent = df.iloc[-FIBO_LOOKBACK - 1:-1]  # exclude current candle for swing calc
+    swing_high = recent["high"].max()
+    swing_low = recent["low"].min()
+    if pd.isna(swing_high) or pd.isna(swing_low) or swing_high == swing_low:
+        return False
+    current_price = df.iloc[-1]["close"]
+    price_range = swing_high - swing_low
+    fibo_50 = swing_high - (price_range * 0.50)
+    fibo_618 = swing_high - (price_range * 0.618)
+    if is_long:
+        return fibo_618 < current_price < fibo_50
+    else:
+        fibo_50_short = swing_low + (price_range * 0.50)
+        fibo_618_short = swing_low + (price_range * 0.618)
+        return fibo_50_short < current_price < fibo_618_short
+
+# ---------------------------
+# Strategy logic
+# ---------------------------
+def strategy_logic(df, symbol, timeframe):
+    """محاسبه سیگنال لانگ/شورت و پیام خروجی"""
+    try:
+        if df is None or len(df) < 200 or pd.isna(df["ema200"].iloc[-1]):
+            return None
+        last = df.iloc[-1]
+        current_price = float(last["close"])
+        ema_200 = float(last["ema200"])
+        rsi = float(last["rsi"]) if not pd.isna(last["rsi"]) else 50.0
+        atr = float(last["atr"]) if not pd.isna(last["atr"]) else 0.0
+        current_volume = float(last["volume"])
+        avg_volume = float(last["avg_vol"]) if not pd.isna(last["avg_vol"]) else 0.0
+
+        # LONG condition
+        trend_is_bullish = current_price > ema_200
+        is_long_pullback = rsi < 40
+
+        if trend_is_bullish and is_long_pullback:
+            star_count = 1
+            if check_fibo_confluence(df, is_long=True):
+                star_count += 1
+            if current_volume > avg_volume:
+                star_count += 1
+            stop_loss = current_price - (atr * 1.5) if atr > 0 else current_price * 0.99
+            risk = current_price - stop_loss
+            take_profit = current_price + (risk * RISK_REWARD)
+            stars = "⭐️" * star_count
+            msg = (
+                f"✅ *LONG BUY SIGNAL* {stars}\n"
+                f"-------------------------------\n"
+                f"📈 *Confidence:* {star_count} Stars\n"
+                f"💎 *Coin:* {symbol} (TF: {timeframe})\n"
+                f"💰 *ENTRY:* {current_price:.8f}\n"
+                f"🎯 *TP:* {take_profit:.8f}\n"
+                f"🛑 *SL:* {stop_loss:.8f}\n"
+                f"⚖️ *R/R Ratio:* 1:{RISK_REWARD}"
+            )
+            return msg
+
+        # SHORT condition
+        trend_is_bearish = current_price < ema_200
+        is_short_pullback = rsi > 60
+
+        if trend_is_bearish and is_short_pullback:
+            star_count = 1
+            if check_fibo_confluence(df, is_long=False):
+                star_count += 1
+            if current_volume > avg_volume:
+                star_count += 1
+            stop_loss = current_price + (atr * 1.5) if atr > 0 else current_price * 1.01
+            risk = stop_loss - current_price
+            take_profit = current_price - (risk * RISK_REWARD)
+            stars = "⭐️" * star_count
+            msg = (
+                f"🔴 *SHORT SELL SIGNAL* {stars}\n"
+                f"-------------------------------\n"
+                f"📉 *Confidence:* {star_count} Stars\n"
+                f"💎 *Coin:* {symbol} (TF: {timeframe})\n"
+                f"💰 *ENTRY:* {current_price:.8f}\n"
+                f"🎯 *TP:* {take_profit:.8f}\n"
+                f"🛑 *SL:* {stop_loss:.8f}\n"
+                f"⚖️ *R/R Ratio:* 1:{RISK_REWARD}"
+            )
+            return msg
+
+        return None
+    except Exception as e:
+        log_message(f"strategy_logic error for {symbol} {timeframe}: {e}", "ERROR")
+        return None
+
+# ---------------------------
+# Run one full cycle
+# ---------------------------
+def run_trading_bot_cycle():
+    """اجرای یک سیکل کامل: اسکن، تحلیل و ارسال پیام"""
+    log_message("Trader Bot Cycle Initiated.", "INFO")
+    if not BOT_TOKEN or not CHAT_ID:
+        log_message("BOT_TOKEN or CHAT_ID not set. Skipping cycle.", "CRITICAL")
+        return
+
+    # اعلان شروع چرخه
+    try:
+        send_telegram_message(f"✅ *ربات تریدر فعال شد!* \n🕰️ زمان اجرا: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} (UTC)\n_اسکن بازار در حال انجام است..._")
+    except Exception:
+        pass
+
+    symbols = get_hot_symbols()
+    if not symbols:
+        log_message("No symbols to process this cycle.", "INFO")
+        return
+
+    for timeframe in TIMEFRAMES:
+        log_message(f"Starting analysis for timeframe: {timeframe}", "INFO")
+        for symbol in symbols:
+            if SHUTDOWN:
+                log_message("Shutdown requested. Breaking symbol loop.", "INFO")
+                return
+            try:
+                df = fetch_and_calculate_data(symbol, timeframe)
+                if df is None:
+                    log_message(f"Could not fetch data for {symbol} on {timeframe}.", "WARNING")
+                    continue
+                signal = strategy_logic(df, symbol, timeframe)
+                if signal:
+                    ok = send_telegram_message(signal)
+                    log_message(f"SIGNAL FOUND: {symbol} on {timeframe}. Sent to Telegram: {ok}", "SUCCESS")
+                    # کوتاهی برای جلوگیری از ریت لیمیت تلگرام / اکسچنج
+                    time.sleep(2)
+            except Exception as e:
+                log_message(f"Unexpected error for {symbol} {timeframe}: {e}", "ERROR")
+                log_message(traceback.format_exc(), "DEBUG")
+                time.sleep(1)
+
+    log_message("Scan cycle complete.", "INFO")
+
+# ---------------------------
+# Main loop
+# ---------------------------
+def main_loop():
+    log_message("Trader bot service starting...", "INFO")
+    # یک پیام اولیه در لاگ بفرست
+    log_message(f"Configuration: TIMEFRAMES={TIMEFRAMES}, SLEEP_INTERVAL={SLEEP_INTERVAL}s, EXCHANGE={EXCHANGE_ID}", "INFO")
+
+    # حلقه تا زمانی که سیگنال شات‌داون نیومده
+    while not SHUTDOWN:
+        try:
+            run_trading_bot_cycle()
+        except Exception as e:
+            log_message(f"run_trading_bot_cycle crashed: {e}", "ERROR")
+            log_message(traceback.format_exc(), "DEBUG")
+        # قبل از خواب، بررسی می‌کنیم که آیا shutdown درخواست شده یا نه
+        for i in range(0, SLEEP_INTERVAL, 5):
+            if SHUTDOWN:
+                break
+            time.sleep(5)
+    log_message("Service stopped gracefully.", "INFO")
+
+
+if __name__ == "__main__":
+    try:
+        main_loop()
+    except Exception as e:
+        log_message(f"Fatal error in main: {e}", "CRITICAL")
+        log_message(traceback.format_exc(), "DEBUG")
+        sys.exit(1)
